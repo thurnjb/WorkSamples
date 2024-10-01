@@ -1,0 +1,553 @@
+'This program reads a table of reports that are scheduled to run on different timings and run them.  It will grab all the reports that are due to run that day and place them into a queue, then open up each individual Access-based report database and run that database's report through data collection, saving the report file, and sending out to email.  It will then update the next scheduled run date based on information given in the table of reports, and at the end of the queue create a summary of the reports that were just run, also sent out through email.
+
+
+Option Compare Database
+
+
+Private Sub CurrentUser_AfterUpdate()
+
+    Forms!Controller.Requery
+
+End Sub
+
+Private Sub Form_Load()
+    
+'This sub runs upon opening the database.  It was going to be used to check if the controller has already been run for the day, but it is not in use.
+'It remains here in case of future use.
+    
+    If DateDiff("d", Date, DLookup("Date_Last_Run", "Controller_Parameters")) < 0 Then
+        Dim thisDb As DAO.Database
+        Set thisDb = CurrentDb()
+        Dim ControlParameters As DAO.Recordset
+        Set ControlParameters = thisDb.OpenRecordset("Controller_Parameters", dbOpenDynaset, dbFailOnError)
+        
+        With ControlParameters
+            .MoveFirst
+            .Edit
+            ![Sent_Today] = 0
+            .Update
+        End With
+    End If
+    
+    
+End Sub
+
+Private Sub Form_Timer()
+
+'This sub used to be based on a timer but now is linked to the 'Run Once' button on the main form.
+'Think of this sub as the 'Main' function where the program is kicked off.
+
+    On Error GoTo ErrorHandler
+    
+    Me.DateTime = Now
+    
+    Dim thisDb As DAO.Database
+    
+    Set thisDb = CurrentDb()
+    
+    Dim ReportList As DAO.Recordset
+    
+    Set ReportList = thisDb.OpenRecordset("Report_List", dbOpenDynaset, dbFailOnError)
+    
+'Go to beginning of Report_List table and post scheduled reports to a queue
+    With ReportList
+        .MoveFirst
+        While Not .EOF
+            If ![Enabled] = True Then
+                If DateDiff("d", Date, ![Report_Date]) <= 0 Then
+                    If DateDiff("s", Now, ![Report_Date]) <= 0 Then
+                        If ![User] = Me.CurrentUser Then
+                            PostToQueue ![GSS_Report_ID], ReportList
+                        End If
+                    End If
+                End If
+            End If
+            .MoveNext
+        Wend
+    End With
+
+    
+'Will return 0 for no error, 1 for error
+'Go to execute the queue
+    SomeError = ExecuteQueue()
+    
+'Check if report list was sent today
+    
+    'Prepare new report list
+    PrepareReport
+    
+    Dim ourDb As DAO.Database
+    Set ourDb = CurrentDb()
+    Dim ControlParameters As DAO.Recordset
+    Set ControlParameters = ourDb.OpenRecordset("Controller_Parameters", dbOpenDynaset, dbFailOnError)
+    
+    'Update validation values
+    With ControlParameters
+        .Edit
+        ![Date_Last_Run] = Date
+        .Update
+    End With
+    ControlParameters.Close
+    Set ourDb = Nothing
+    
+    DoCmd.SetWarnings False
+    DoCmd.OpenQuery "A 00)  Clear Reports Generated Table"
+    DoCmd.SetWarnings True
+    
+CleanUp:
+'Close connections after use
+    ReportList.Close
+    
+    Set thisDb = Nothing
+    Exit Sub
+    
+ErrorHandler:
+    MsgBox Err.Description
+    GoTo CleanUp
+    
+End Sub
+Private Function PostToQueue(ByVal ReportListID As Integer, ByRef theReportList As DAO.Recordset) As Long
+
+'This function will post scheduled reports into the Report_Queue from the Report_List table.
+'Note: if the controller breaks halfway through a run, you will have to go into the queue and manually delete what is still in there, or else you will get duplicate runs.
+
+    On Error GoTo ErrorHandler
+    
+    theResult = 0
+
+'Retrieve necessary fields according to parameter ReportListID
+    With theReportList
+        .FindNext "[GSS_Report_ID] = " & ReportListID
+        ExecuteCommand = ![Command_To_Execute]
+        frequencyLabel = ![Report_Frequency]
+        currentSchedule = ![Report_Date]
+    End With
+    
+    Dim thisDb As DAO.Database
+    Dim ReportQueue As DAO.Recordset
+    Set thisDb = CurrentDb()
+    Set ReportQueue = thisDb.OpenRecordset("Report_Queue", dbOpenDynaset, dbFailOnError)
+    
+'Create new record in Queue
+    With ReportQueue
+        On Error Resume Next
+        .MoveFirst
+        On Error GoTo ErrorHandler
+        .AddNew
+        ![GSS_Report_ID] = ReportListID
+        ![Command_To_Execute] = ExecuteCommand
+        ![frequencyLabel] = frequencyLabel
+        .Update
+    'Close connection after use
+        .Close
+    End With
+    
+    PostToQueue = theResult
+    
+    Exit Function
+    
+'Return error number, or 0 for no error
+ErrorHandler:
+    theResult = Err.Number
+    theDescription = Err.Description
+    
+End Function
+Private Function ExecuteQueue() As Long
+    
+'This function will iterate through the Report_Queue generated from before and run each report in the queue.
+    
+    On Error GoTo ErrorHandler
+    ReturnValue = 0
+    
+    Dim thisDb As DAO.Database
+    Dim ReportQueue As DAO.Recordset
+    Dim reportsGenerated As DAO.Recordset
+    
+    Set thisDb = CurrentDb()
+    Set ReportQueue = thisDb.OpenRecordset("Report_Queue", dbOpenDynaset, dbFailOnError)
+    Set reportsGenerated = thisDb.OpenRecordset("Reports_Generated", dbOpenDynaset, dbFailOnError)
+    
+'Execute report in queue and remove from queue
+    With ReportQueue
+        On Error Resume Next
+        .MoveFirst
+        On Error GoTo ErrorHandler
+        'Iterate through Report_Queue and collect necessary fields and run report.
+        While Not .EOF
+            ReportID = ![GSS_Report_ID]
+            ExecuteCommand = ![Command_To_Execute]
+            frequencyLabel = ![frequencyLabel]
+            theResult = ExecuteReport(ReportID, ExecuteCommand) 'This is the execute command.
+            
+            'Store reports that have run in Reports_Generated that at the end will output an email listing which reports were run.
+            With reportsGenerated
+                On Error Resume Next
+                .MoveFirst
+                On Error GoTo ErrorHandler
+                .AddNew
+                reportTitle = DLookup("Report_Standard_Title", "GSS_Report_Issuance_Specifications", "[kyf_Report_ID] = " & ReportID)
+                ![GSS_Report_ID] = ReportID
+                ![Report_Title] = reportTitle
+                ![Frequency] = frequencyLabel
+                'Typically if the report fails to run, the actual report database will give an error that is not translated to here and will most likely still say "Completed"
+                'It will output "Failed" if the controller was unable to find the report like if the link in RMDB is bad
+                If theResult <> "" Then
+                    ![Report_Status] = "Failed"
+                    ![Error_Message] = theResult
+                Else
+                    ![Report_Status] = "Completed"
+                End If
+                scheduledRun = DLookup("Report_Date", "Report_List", "[GSS_Report_ID] = " & ReportID)
+                ![Requested_Date] = scheduledRun
+                ![Run_Time] = Now
+                .Update
+            End With
+                Dim ourDb As DAO.Database
+                Set ourDb = CurrentDb()
+                Dim theReportList As DAO.Recordset
+                Set theReportList = CurrentDb.OpenRecordset("Report_List", dbOpenDynaset, dbFailOnError)
+                
+                LatestSpecID = DMax("kyp_Issuance_Specification_ID", "GSS_Report_Issuance_Specifications", "[kyf_Report_ID] = " & ReportID)
+                reportScheduleDate = DLookup("Report_Date", "Report_List", "[GSS_Report_ID] = " & ReportID)
+                
+                'Edit ReportList with new fields
+                With theReportList
+                    'Find next schedule date
+                    nextSchedule = FindNextScheduleDT(frequencyLabel, ReportID, reportScheduleDate)
+                    With reportsGenerated
+                        .FindFirst "[GSS_Report_ID] = " & ReportID
+                        .Edit
+                        ![Next_Run_Date] = nextSchedule
+                        .Update
+                    End With
+                    .FindNext "[GSS_Report_ID] = " & ReportID
+                    .Edit
+                    ![Report_Date] = nextSchedule
+                    ![Run_Status] = "Completed"
+                    ![Last_Run_Time] = Now
+                    .Update
+                End With
+            .Delete
+            .MoveNext
+        Wend
+    End With
+    
+    ReportQueue.Close
+    reportsGenerated.Close
+    theReportList.Close
+    Set ReportQueue = Nothing
+    Set reportsGenerated = Nothing
+    Set thisDb = Nothing
+    
+'Return 0 for no error, 1 for error
+    ExecuteQueue = ReturnValue
+    
+    Exit Function
+    
+ErrorHandler:
+    MsgBox Err.Number & Err.Description
+    ExecuteQueue = 1
+    
+End Function
+
+Private Function ExecuteReport(ByVal ReportID As Long, ByVal ExecuteCommand As String) As String
+    
+'This function will capture necessary fields from back-end tables and open the report database and run the whole report.
+    
+    ExecuteReport = 0
+    theResult = 0
+    
+    On Error GoTo ErrorHandler
+    
+    Dim accessApp As Access.Application
+
+'Find reportID, frequency, current date, database file path, and command to run from back-end tables and Report_List
+    LatestSpecID = DMax("kyp_Issuance_Specification_ID", "GSS_Report_Issuance_Specifications", "[kyf_Report_ID] = " & ReportID)
+    DatabaseFileName = DLookup("Report_File_URL", "GSS_Reports", "[kyp_Report_ID] = " & ReportID)
+    frequencyLabel = DLookup("Report_Frequency", "Report_List", "[GSS_Report_ID] = " & ReportID)
+    reportScheduleDate = DLookup("Report_Date", "Report_List", "[GSS_Report_ID] = " & ReportID)
+    
+    Set accessApp = Nothing
+    Set accessApp = CreateObject("Access.Application")
+    
+'Open report database and run given command
+    accessApp.OpenCurrentDatabase DatabaseFileName
+    errorResult = accessApp.Run(ExecuteCommand)
+    
+'Very important to close objects in memory after use.
+'Not closing objects in memory can lead to memory issues and errors
+    accessApp.Quit
+    Set accessApp = Nothing
+    
+closeOut:
+    ExecuteReport = errorResult
+    Exit Function
+      
+ErrorHandler:
+    theResult = Err.Number
+    theDescription = Err.Description
+    accessApp.Quit
+    ExecuteReport = theDescription
+       
+End Function
+
+Private Function FindNextScheduleDT(ByVal frequencyLabel As Variant, ByVal GSS_ID As Integer, ByVal currentSchedule As Date) As Date
+    
+'This function finds the next scheduled date for each report that was run based on the Report_Frequency in Report_List table
+    
+    On Error GoTo ErrorHandler
+    
+    
+'Select case based on report frequency located in Report_List that adds according time interval to current schedule
+    Select Case frequencyLabel
+        Case "Daily"
+            If Weekday(currentSchedule) = 6 Then
+                newScheduleDate = DateAdd("d", 3, currentSchedule)
+            Else
+                newScheduleDate = DateAdd("d", 1, currentSchedule)
+            End If
+        Case "Mon Wed Fri"
+            If Weekday(currentSchedule) = 6 Then
+                newScheduleDate = DateAdd("d", 3, currentSchedule)
+            Else
+                newScheduleDate = DateAdd("d", 2, currentSchedule)
+            End If
+        Case "Tue Thu"
+            If Weekday(currentSchedule) = 5 Then
+                newScheduleDate = DateAdd("d", 5, currentSchedule)
+            Else
+                newScheduleDate = DateAdd("d", 2, currentSchedule)
+            End If
+        Case "Every Monday"
+            newScheduleDate = DateAdd("ww", 1, currentSchedule)
+        Case "Every Tuesday"
+            newScheduleDate = DateAdd("ww", 1, currentSchedule)
+        Case "Every Wednesday"
+            newScheduleDate = DateAdd("ww", 1, currentSchedule)
+        Case "Every Thursday"
+            newScheduleDate = DateAdd("ww", 1, currentSchedule)
+        Case "Every Friday"
+            newScheduleDate = DateAdd("ww", 1, currentSchedule)
+        Case "Weekly"
+            newScheduleDate = DateAdd("ww", 1, currentSchedule)
+    'Semiweekly Mon or Thu
+        Case "Semiweekly"
+            If Weekday(currentSchedule) = 2 Then
+                newScheduleDate = DateAdd("d", 3, currentSchedule)
+            Else
+                newScheduleDate = DateAdd("d", 4, currentSchedule)
+            End If
+        Case "Monthly"
+            newScheduleDate = DateAdd("m", 1, currentSchedule)
+    'Semimonthly 1st or 16th
+        Case "Semimonthly"
+            If Day(currentSchedule) = 1 Then
+                newScheduleDate = DateAdd("d", 15, currentSchedule)
+            Else
+                newScheduleDate = DateSerial(Year(Date), Month(currentSchedule) + 1, 1)
+            End If
+        Case "Quarterly"
+            newScheduleDate = DateAdd("q", 1, currentSchedule)
+        Case "Semiannual"
+            newScheduleDate = DateAdd("m", 6, currentSchedule)
+        Case "Annual"
+            newScheduleDate = DateAdd("yyyy", 1, currentSchedule)
+    End Select
+    
+'Return new date
+    FindNextScheduleDT = newScheduleDate
+    
+ErrorHandler:
+    theResult = Err.Number
+    theDescription = Err.Description
+    
+End Function
+
+Private Sub PrepareReport()
+
+    'Create Excel sheet with reports generated for the day
+    periodEndDate = Format(Date, "yyyy-mm-dd")
+    
+    rptFilePath = "B:\Reporting Reference Information\Reporting Automation\Reports"
+    rptFilePath = rptFilePath & "\" & Me.CurrentUser & " Report List for " & periodEndDate & ".xlsx"
+    
+    theTabName = "Sent Reports"
+    theTableSrc = "Reports_Generated"
+    DoCmd.TransferSpreadsheet acExport, , theTableSrc, rptFilePath, , theTabName
+    
+    FormatSS rptFilePath
+    
+
+End Sub
+
+Private Sub FormatSS(ByVal rptFilePath As String)
+
+'Format the generated report list at the end of the runthrough.
+
+    Dim anExcelApp As Excel.Application
+    Dim aWorkbook As Excel.Workbook
+    Dim theSheet As Excel.Worksheet
+    
+    Set anExcelApp = CreateObject("Excel.Application")
+    
+    On Error GoTo CloseOutApp
+    
+    Set aWorkbook = anExcelApp.Workbooks.Open(rptFilePath)
+    
+    On Error GoTo CloseOutWorkbook
+    
+    Dim theUsedRange As String
+    Dim theHeadingsRange As Range
+    
+    For Each theSheet In aWorkbook.Worksheets
+        If theSheet.UsedRange.Address <> "$A$1" Or theSheet.Range("A1") <> "" Then
+            With theSheet
+                aName = Replace(.Name, "_", " ")
+                .Name = aName
+                .Cells.Font.Name = "Calibri"
+                .Cells.Font.Size = 11
+                theUsedRange = .UsedRange.Address
+                theMaxCell = Right(theUsedRange, Len(theUsedRange) - InStr(theUsedRange, ":$") - 1)
+                theColumnChar = Left(theMaxCell, InStr(theMaxCell, "$") - 1)
+                theRightCell = theColumnChar & "1"
+                Set theHeadingsRange = .Range("A1", theRightCell)
+                theHeadingsRange.Interior.Color = RGB(207, 207, 207)
+                theHeadingsRange.Font.Bold = True
+                theHeadingsRange.HorizontalAlignment = xlCenter
+                theHeadingsRange.Borders.Color = RGB(0, 0, 0)
+                
+                .Columns.AutoFit
+                
+                .Activate
+                .Application.ActiveWindow.FreezePanes = False
+                .Rows("2:2").Select
+                .Application.ActiveWindow.FreezePanes = True
+                .Range("$A$1").Select
+            End With
+        End If
+    Next
+    
+    aWorkbook.Worksheets(1).Activate
+    
+    aWorkbook.Worksheets(1).Range("C:D").NumberFormat = "mm/dd/yyyy hh:mm:ss AM/PM"
+    
+    aWorkbook.Save
+    aWorkbook.Close
+    
+    anExcelApp.Quit
+    
+    SendReport rptFilePath
+    
+    Exit Sub
+    
+CloseOutWorkbook:
+    aWorkbook.Save
+    aWorkbook.Close
+    
+CloseOutApp:
+    anExcelApp.Quit
+
+End Sub
+
+Private Sub SendReport(ByVal rptFilePath As String)
+    
+'Send the generated report list out to email.
+    
+    On Error GoTo ErrorHandler
+    
+    periodEndDate = Format(Date, "yyyy-mm-dd")
+    
+    msgSubject = Me.CurrentUser & "'s Report List for " & periodEndDate
+    
+    msgBody = "<BODY style=font-size:11pt;font-family:Calibri>Good morning,"
+    msgBody = msgBody & "<br><br>The list of automated reports run today is attached."
+    msgBody = msgBody & "<br><br>Thanks,"
+    
+    Dim theOutlookApp As Object
+    Dim theMailItem As Object
+    
+    On Error Resume Next
+    Set theOutlookApp = GetObject(, "Outlook.Application")
+    On Error GoTo ErrorHandler
+    
+    If theOutlookApp Is Nothing Then
+        Set theOutlookApp = CreateObject("Outlook.Application")
+    End If
+    
+    Set theMailItem = theOutlookApp.CreateItem(0)
+    
+    With theMailItem
+        .Display
+        signature = .HTMLBody
+        .To = "GSSReporting"
+        .Subject = msgSubject
+        .HTMLBody = msgBody & vbNewLine & signature
+        .Attachments.Add (rptFilePath)
+        .Display
+    End With
+    
+CleanUp:
+    Set theMailItem = Nothing
+    Set theOutlookApp = Nothing
+    Exit Sub
+
+ErrorHandler:
+    MsgBox Err.Description
+    GoTo CleanUp
+
+End Sub
+
+Private Sub RunOnce_Click()
+
+    Form_Timer
+
+End Sub
+
+Private Sub SkipOneDay_Click()
+
+'This function will help to correct Report_Date in Report_List to the current day.  This is useful if you missed running the controller for a day or for holidays.
+
+    On Error GoTo ErrorHandler
+
+    Dim ourDb As DAO.Database
+    Set ourDb = CurrentDb()
+    Dim theReportList As DAO.Recordset
+    Set theReportList = CurrentDb.OpenRecordset("Report_List", dbOpenDynaset, dbFailOnError)
+    
+    
+    With theReportList
+        On Error Resume Next
+        .MoveFirst
+        
+        
+        While Not .EOF
+        ReportID = ![GSS_Report_ID]
+        frequencyLabel = ![Report_Frequency]
+        reportScheduleDate = ![Report_Date]
+        
+                Do While reportScheduleDate <= Date
+                'Find next schedule date
+                ReportID = ![GSS_Report_ID]
+                frequencyLabel = ![Report_Frequency]
+                reportScheduleDate = ![Report_Date]
+                nextSchedule = FindNextScheduleDT(frequencyLabel, ReportID, reportScheduleDate)
+
+                .Edit
+                ![Report_Date] = nextSchedule
+                ![Run_Status] = "Date Changed"
+                ![Last_Run_Time] = Now
+                .Update
+                
+                reportScheduleDate = ![Report_Date]
+                Loop
+        .MoveNext
+        Wend
+    End With
+    
+Exit Sub
+    
+ErrorHandler:
+
+    MsgBox Err.Description
+
+End Sub

@@ -1,0 +1,301 @@
+/*This report captures sales orders and sales quotes and aggregates them by company teams.
+
+
+
+USE ***
+GO
+
+	--	If the temporary table #ALLSALES exists, drop it and then re-create it in the following queries.
+
+		IF OBJECT_ID ( 'tempdb..#ALLSALES' ) IS NOT NULL
+			DROP TABLE #ALLSALES
+		;
+		IF OBJECT_ID ( 'tempdb..#ALLQUOTES' ) IS NOT NULL
+			DROP TABLE #ALLQUOTES			
+		;
+				
+
+		DECLARE
+			@FROM_DATE		DATE			=	'2024-07-01',	
+			@THRU_DATE		DATE			=	'2024-07-31'
+
+		;
+
+
+		SELECT
+			ALL_SALES.*
+		INTO
+			#ALLSALES
+		FROM
+			(
+				(
+				SELECT
+						SIH.[Sell-to Customer No_] AS [Sell-to Customer No]
+					,	SIH.[Sell-to Customer Name]
+					,	SIH.[Customer Posting Group] AS [CPG]
+					,	SIH.[Your Reference] AS [Customer PO No]
+					,	SIH.[Contact Name]
+					,	SIH.[Salesperson Code]
+					,	SIH.[Sales User ID]
+					,	SIH.[Sales Team]
+					,	SIH.[User ID]
+					,	'' AS [Standing Order]
+					,	SIH.[Quotation Date] AS [Quotation Date]
+					,	SIH.[Quote No_] AS [Quote No_]
+					,	CAST ( SIH.[Order Date] AS DATE ) AS [Order Date]
+					,	SIH.[Order No_] AS [Order No]
+					,	CAST ( SIH.[Posting Date] AS DATE )  AS [Invoice Date]
+					,	SIH.[No_] AS [Invoice No_]
+					,	SIH.[Ship-to Code]
+					,	SIH.[Ship-to Name]
+					,	SIH.[Ship-to Address]
+					,	SIH.[Ship-to Address 2]
+					,	SIH.[Ship-to City]
+					,	SIH.[Ship-to County] AS [Ship-to State]
+					,	SIH.[Ship-to Post Code]
+					,	SIL.[Purchasing Code]
+					,	SIH.[External Document No_]
+					,	SIH.[State Contract No_ 2]
+					,	SIL.[Line No_] AS [Line No]
+					,	SIL.[No_] AS [Item No_]
+					,	SIL.[Description] + SIL.[Description 2] AS [Description]
+					,	IV.[Vendor No_] AS [Vendor No]
+					,	VNDR.[Name] AS [Vendor Name]
+					,	IV.[Vendor Item No_]
+					,	IV.[Base Unit of Measure] AS [UoM]
+					,	SIL.[Alt Vendor Name_No] AS [Alt Item No]
+					,	SIL.[Vendor Quote No_]
+					,	CAST ( SIL.[Quantity] AS FLOAT ) AS [Quantity]
+					,	CAST ( SIL.[Unit Price] AS MONEY ) AS [Unit Price]
+					,	CAST ( SIL.[Unit Cost (LCY)] AS MONEY ) AS [Unit Cost (LCY)]
+					,	CAST ( SIL.[Manufacturer List Price] AS MONEY ) AS [Mfr List Price]
+					,	CAST ( SIL.[Amount] AS MONEY ) AS [Amount]
+					,	CAST ( SIL.[Quantity] * SIL.[Unit Cost (LCY)] AS MONEY ) AS [Ext Cost]
+					,	CAST ( '' AS NVARCHAR(50) ) AS [PO No]
+					,	CAST ( '' AS NVARCHAR(50) ) AS [Sp PO No]
+					/*	Additional Fields that are called for occasionally
+					,	IV.[Controlled Substance]
+					,	sih.[BPA No_]
+					,	'' AS [Purchase Order No_]
+					,	'' AS [GSS Sp PO No]
+					,	SIL.[ML]
+					,	SIL.[Certificate Required]
+					*/
+					,	SIH.[Notes]
+				FROM
+					[dbo].[Sales Invoice Header] AS SIH
+					INNER JOIN
+					[dbo].[Sales Invoice Line] AS SIL
+						ON	SIH.[No_] = SIL.[Document No_]
+					INNER JOIN
+					[dbo].[ItemView] AS IV
+						ON	SIL.[No_] = IV.[No_]
+					INNER JOIN
+					[dbo].[Vendor] AS VNDR
+						ON	IV.[Vendor No_] = VNDR.[No_]
+				WHERE
+						SIH.[Order Date] >= @FROM_DATE
+					AND	SIH.[Order Date] <= @THRU_DATE
+					AND [Quantity] <> 0--	Not Equals is used to enable capture of balancing entries with 'ACCT' Purchasing Codes.
+					AND SIL.[Purchasing Code] NOT IN ('301RMA', '101-RMA', 'CNCLD')
+					AND SIL.Type IN ( 1, 2 )
+				) -- AS INV_SALES
+				UNION
+				(
+				SELECT
+						SOH.[Sell-to Customer No_] AS [Sell-to Customer No]
+					,	SOH.[Sell-to Customer Name]
+					,	SOH.[Customer Posting Group] AS [CPG]
+					,	SOH.[Your Reference] AS [Customer PO No]
+					,	SOH.[Contact Name]
+					,	SOH.[Salesperson Code]
+					,	SOH.[User ID] AS [Sales User ID] --In a Sales Order, the User ID field contains the ID of the Salesperson who originated the order
+					,	SOH.[Sales Team]
+					,	SOH.[User ID]
+					,	SOH.[Standing Order] AS [Standing Order]
+					,	SOH.[Quotation Date] AS [Quotation Date]
+					,	SOH.[Quote No_] AS [Quote No_]
+					,	CAST ( SOH.[Order Date] AS DATE ) AS [Order Date]
+					,	SOH.[No_] AS [Order No]
+					,	CAST ( '' AS DATE ) AS [Invoice Date]
+					,	'' AS [Invoice No_]
+					,	SOH.[Ship-to Code]
+					,	SOH.[Ship-to Name]
+					,	SOH.[Ship-to Address]
+					,	SOH.[Ship-to Address 2]
+					,	SOH.[Ship-to City]
+					,	SOH.[Ship-to County] AS [Ship-to State]
+					,	SOH.[Ship-to Post Code]
+					,	SOL.[Purchasing Code]
+					,	SOH.[External Document No_]
+					,	SOH.[State Contract No_ 2]
+					,	SOL.[Line No_] AS [Line No]
+					,	SOL.[No_] AS [Item No_]
+					,	SOL.[Description] + SOL.[Description 2] AS [Description]
+					,	IV.[Vendor No_] AS [Vendor No]
+					,	VNDR.[Name] AS [Vendor Name]
+					,	IV.[Vendor Item No_]
+					,	IV.[Base Unit of Measure] AS [UoM]
+					,	SOL.[Alt Vendor Name_No_] AS [Alt Item No]
+					,	SOL.[Vendor Quote No_]
+					,	CAST ( ( SOL.[Quantity] - SOL.[Quantity Invoiced] ) AS FLOAT ) AS [Quantity]
+					,	CAST ( SOL.[Unit Price] AS MONEY ) AS [Unit Price]
+					,	CAST ( SOL.[Unit Cost (LCY)] AS MONEY ) AS [Unit Cost (LCY)]
+					,	CAST ( SOL.[Manufacturer List Price] AS MONEY ) AS [Mfr List Price]
+					,	CAST ( ( ( SOL.[Quantity] - SOL.[Quantity Invoiced] ) * SOL.[Unit Price] ) AS MONEY ) AS [Amount]
+					,	CAST ( ( ( SOL.[Quantity] - SOL.[Quantity Invoiced] ) * SOL.[Unit Cost (LCY)] ) AS MONEY ) AS [Ext Cost]
+					,	SOL.[Purchase Order No_] AS [PO No_]
+					,	SOL.[Special Order Purchase No_] AS [PO No_]
+					/*	Additional Fields that are called for occasionally
+					,	IV.[Controlled Substance]
+					,	SOH.[BPA No]
+					,	SOL.[Purchase Order No_]
+					,	SOL.[Special Order Purchase No_] AS [GSS Sp PO No]
+					,	SOL.[ML]
+					,	SOL.[Certificate Required]
+					*/
+					,	SOH.[Notes]
+				FROM
+					[dbo].[Sales Header] AS SOH
+					INNER JOIN
+					[dbo].[Sales Line] AS SOL
+						ON	SOH.[No_] = SOL.[Document No_]
+					INNER JOIN
+					[dbo].[ItemView] AS IV
+						ON	SOL.[No_] = IV.[No_]
+					INNER JOIN
+					[dbo].[Vendor] AS VNDR
+						ON	IV.[Vendor No_] = VNDR.[No_]
+				WHERE
+					SOH.[Order Date] >= @FROM_DATE
+					AND	SOH.[Order Date] <= @THRU_DATE
+					AND	SOH.[Document Type] IN ( 0, 1 )	
+					AND CAST ( ( SOL.[Quantity] - SOL.[Quantity Invoiced] ) AS FLOAT ) > 0
+					AND SOL.[Purchasing Code] NOT IN ('301RMA', '101-RMA', 'CNCLD')
+					AND SOL.Type IN ( 2 )		--1 - Include Accounting Entries, 2 - Include Item Entries
+				) -- AS OPN_SALES
+			) AS ALL_SALES
+		--	Enter your WHERE clause here
+
+				ORDER BY
+					[Order Date], [Order No], [Line No], [Invoice Date], [Invoice No_]
+				;
+
+				SELECT
+						SOH.[Sell-to Customer No_]
+					,	SOH.[Sell-to Customer Name]
+					,	SOH.[Your Reference] AS [Customer PO No]
+					,	SOH.[Contact Name]
+					,	SOH.[Salesperson Code]
+					,	SOH.[User ID] AS [Sales User ID]
+					,	SOH.[User ID]
+					,	SOH.[Sales Team]
+					,	CAST ( SOH.[Order Date] AS DATE ) AS [Order Date]
+					,	SOH.[No_] AS [Order No_]
+					,	SOH.[Quotation Date]
+					,	SOH.[Quote No_]
+					,	SOH.[Ship-to Code]
+					,	SOH.[Ship-to Name]
+					,	SOH.[Ship-to Address]
+					,	SOH.[Ship-to Address 2]
+					,	SOH.[Ship-to City]
+					,	SOH.[Ship-to County] AS [Ship-to State]
+					,	SOH.[Ship-to Post Code]
+					,	SOL.[Purchasing Code]
+					,	SOH.[External Document No_]
+					,	SOL.[Line No_]
+					,	SOL.[No_] AS [Item No_]
+					,	SOL.[Description] + SOL.[Description 2] AS [Description]
+					,	IV.[Vendor No_]
+					,	VNDR.[Name] AS [Vendor Name]
+					,	IV.[Vendor Item No_]
+					,	IV.[Base Unit of Measure] AS [UoM]
+				--	,	IV.[Controlled Substance]
+					,	SOL.[Purchase Order No_]
+					,	SOL.[Purch_ Order Line No_]
+					,	CAST ( ( SOL.[Quantity] - SOL.[Quantity Invoiced] ) AS FLOAT ) AS [Quantity]
+					,	CAST ( SOL.[Unit Price] AS MONEY ) AS [Unit Price]
+					,	CAST ( SOL.[Unit Cost (LCY)] AS MONEY ) AS [Unit Cost (LCY)]
+					,	CAST ( ( ( SOL.[Quantity] - SOL.[Quantity Invoiced] ) * SOL.[Unit Price] ) AS MONEY ) AS [Amount]
+					,	CAST ( SOL.[Quantity] * SOL.[Unit Cost (LCY)] AS MONEY ) AS [Ext Cost]
+				--	,	sih.[BPA No_]
+				--	,	SIH.[Notes]
+				INTO
+					#ALLQUOTES
+				FROM
+					[dbo].[Sales Header] AS SOH
+					INNER JOIN
+					[dbo].[Sales Line] AS SOL
+						ON	SOH.[No_] = SOL.[Document No_]
+					INNER JOIN
+					[dbo].[ItemView] AS IV
+						ON	SOL.[No_] = IV.[No_]
+					INNER JOIN
+					[dbo].[Vendor] AS VNDR
+						ON	IV.[Vendor No_] = VNDR.[No_]
+				WHERE
+						SOH.[Quotation Date] >= @FROM_DATE
+					AND	SOH.[Quotation Date] <= @THRU_DATE
+					AND SOH.[Document Type] IN ( 0 )	--Add 0 to list to include Quotes, 1 to include Sales Orders, ...
+					AND [Quantity] > 0			--Not Equals is used to enable capture of balancing entries with 'ACCT' Purchasing Codes.
+					AND SOL.[Purchasing Code] NOT IN ('301RMA', '101-RMA', 'CNCLD')
+					AND SOL.Type IN ( 1, 2 )		--Add 1 to list to include General Ledger entries, 2 to include Items, ...
+
+				ORDER BY
+					[Order Date], [Order No_], [Line No_]
+				;
+
+
+		SELECT 'Order Summary by Team' as [Report Section]
+
+			SELECT 
+				OrderSummary.Year
+				,OrderSummary.Month
+				,OrderSummary.[Sales Team]
+				,COUNT(OrderSummary.[Order No]) as [No of Orders]
+				,SUM(OrderSummary.[Total Amount]) as [Total Amount]
+			FROM
+				(
+					SELECT 
+						 Year([Order Date]) as [Year]
+						,Month([Order Date]) as [Month]
+						,[Sales Team]
+						,[Order No]
+						, SUM([Amount]) as [Total Amount]
+					FROM 
+						#ALLSALES
+					GROUP BY
+						[Order No], Year([Order Date]), Month([Order Date]), [Sales Team]
+				) as OrderSummary
+			GROUP BY
+				OrderSummary.Year, OrderSummary.Month, OrderSummary.[Sales Team]
+			ORDER BY
+				OrderSummary.Year, OrderSummary.Month, OrderSummary.[Sales Team]
+
+
+	SELECT 'Quote Summary by Team' as [Report Section]
+
+			SELECT 
+				OrderSummary.Year
+				, OrderSummary.Month
+				,OrderSummary.[Sales Team]
+				, COUNT(OrderSummary.[Order No]) as [No of Quotes]
+				, SUM(OrderSummary.[Total Amount]) as [Total Amount]
+			FROM
+				(
+					SELECT 
+						 Year([Quotation Date]) as [Year]
+						,Month([Quotation Date]) as [Month]
+						,[Sales Team]
+						,[Order No_] as [Order No]
+						, SUM([Amount]) as [Total Amount]
+					FROM 
+						#ALLQUOTES
+					GROUP BY
+						[Order No_], Year([Quotation Date]), Month([Quotation Date]), [Sales Team]
+				) as OrderSummary
+			GROUP BY
+				OrderSummary.Year, OrderSummary.Month, OrderSummary.[Sales Team]
+			ORDER BY
+				OrderSummary.Year, OrderSummary.Month, OrderSummary.[Sales Team]
+
